@@ -16,7 +16,9 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Windows.Forms;
 using Aga.Controls.Tree;
 using Aga.Controls.Tree.NodeControls;
@@ -27,7 +29,7 @@ using OpenHardwareMonitor.Utilities;
 namespace OpenHardwareMonitor.GUI {
   public partial class MainForm : Form {
 
-    private PersistentSettings settings;
+    public PersistentSettings settings;
     private UnitManager unitManager;
     private Computer computer;
     private Node root;
@@ -65,6 +67,9 @@ namespace OpenHardwareMonitor.GUI {
 
     private UserOption runWebServer;
     private HttpServer server;
+
+    private UserOption runSerial;
+    private Serial serial;
 
     private UserOption logSensors;
     private UserRadioGroup loggingInterval;
@@ -291,6 +296,16 @@ namespace OpenHardwareMonitor.GUI {
           server.StartHTTPListener();
         else
           server.StopHTTPListener();
+      };
+
+      serial = new Serial();
+      runSerial = new UserOption("runSerialMenuItem", false, runSerialMenuItem, settings);
+      runSerial.Changed += delegate (object sender, EventArgs e) {
+        if (runSerial.Value) {
+          serial.Open();
+        } else {
+          serial.Close();
+        }
       };
 
       logSensors = new UserOption("logSensorsMenuItem", false, logSensorsMenuItem,
@@ -572,6 +587,101 @@ namespace OpenHardwareMonitor.GUI {
       Close();
     }
 
+    float MaxTemp(Computer computer, HardwareType type) {
+      var hw = computer.Hardware;
+      var gpus = hw.Where(x => x.HardwareType == type).ToArray();
+      if (gpus.Any()) {
+        float t = 0;
+        foreach (var gpu in gpus) {
+          var temps = gpu.Sensors.Where(x => x.SensorType == SensorType.Temperature).ToArray();
+          if (temps.Any()) {
+            var temp = temps.Max(x => x.Value.Value);
+            t = Math.Max(temp, t);
+          }
+
+          foreach (var sh in gpu.SubHardware) {
+            temps = sh.Sensors.Where(x => x.SensorType == SensorType.Temperature).ToArray();
+            if (temps.Any()) {
+              var temp = temps.Max(x => x.Value.Value);
+              t = Math.Max(temp, t);
+            }
+          }
+        }
+
+        return t;
+      } else {
+        return 0;
+      }
+    }
+    float UsageInPercent(Computer computer, HardwareType type, string Name) {
+      int n = 0;
+      float p = -1;
+      var elements = computer.Hardware.Where(device => device.HardwareType == type).ToArray();
+      if (elements.Count() > 0) {
+        foreach (var hardware in elements) {
+          var temps = hardware.Sensors.Where(x => x.Name == Name
+              && x.SensorType == SensorType.Load).ToArray();
+          if (temps.Count() != 0) {
+            n++;
+            p = temps.Average(temp => temp.Value.Value);
+          }
+        }
+      }
+      return n > 0 ? p / n : 0;
+    }
+    float UsageInPercent(Computer computer, HardwareType type) {
+
+      int n = 0;
+      float p = -1;
+      var elements = computer.Hardware.Where(x => x.HardwareType == type).ToArray();
+      if (elements.Count() > 0) {
+
+
+        foreach (var hardware in elements) {
+
+          var temps = hardware.Sensors.Where(x => x.SensorType == SensorType.Load).ToArray();
+          if (temps.Count() != 0) {
+            n++;
+            p = temps.Average(temp => temp.Value.Value);
+          }
+
+        }
+      }
+      return n > 0 ? p / n : 0;
+    }
+    float AvgTemp(Computer computer, HardwareType type) {
+      var gpus = computer.Hardware.Where(x => x.HardwareType == type).ToArray();
+      if (gpus.Any()) {
+        int n = 0;
+        float t = 0;
+        foreach (var gpu in gpus) {
+          var temps = gpu.Sensors.Where(x => x.SensorType == SensorType.Temperature).ToArray();
+          if (temps.Any()) {
+            var temp = temps.Average(x => x.Value.Value);
+            t += temp;
+            n++;
+          }
+
+          foreach (var sh in gpu.SubHardware) {
+            temps = sh.Sensors.Where(x => x.SensorType == SensorType.Temperature).ToArray();
+            if (temps.Any()) {
+              var temp = temps.Average(x => x.Value.Value);
+              t += temp;
+              n++;
+            }
+          }
+        }
+
+        if (n > 0) {
+          return t / (float)n;
+        } else {
+          return 0;
+        }
+      } else {
+        return 0;
+      }
+    }
+
     private int delayCount = 0;
     private void timer_Tick(object sender, EventArgs e) {
       computer.Accept(updateVisitor);
@@ -584,6 +694,53 @@ namespace OpenHardwareMonitor.GUI {
       if (wmiProvider != null)
         wmiProvider.Update();
 
+      var gpuMaxTemp = Math.Max(
+        (int)MaxTemp(computer, HardwareType.GpuNvidia),
+        (int)MaxTemp(computer, HardwareType.GpuAti)
+      );
+      var gpuMaxUsage = Math.Max(
+        (int)UsageInPercent(computer, HardwareType.GpuAti, "GPU Core"),
+        (int)UsageInPercent(computer, HardwareType.GpuNvidia, "GPU Core")
+      );
+      var gpuMaxMemory = Math.Max(
+        (int)UsageInPercent(computer, HardwareType.GpuAti, "GPU Memory"),
+        (int)UsageInPercent(computer, HardwareType.GpuNvidia, "GPU Memory")
+      );
+
+      List<float> data = new List<float>
+        {
+            (int)MaxTemp(computer, HardwareType.CPU),
+            gpuMaxTemp,
+            (int)MaxTemp(computer, HardwareType.Mainboard),
+            (int)MaxTemp(computer, HardwareType.HDD),
+            (int)UsageInPercent(computer, HardwareType.CPU, "CPU Total"),
+            (int)gpuMaxUsage,
+            (int)UsageInPercent(computer, HardwareType.RAM, "Memory"),
+            (int)gpuMaxMemory,
+
+            // Right group.
+            settings.GetValue("nMaxFan", 100),
+            settings.GetValue("nMinFan", 20),
+            settings.GetValue("nMaxTemp", 100),
+            settings.GetValue("nMinTemp", 10),
+
+            // Flags
+            settings.GetValue("chkManualFan", false) ? 1 : 0,
+            settings.GetValue("chkManualColor", false) ? 1 : 0,
+
+            // Sliders.
+            settings.GetValue("sldManualFan", 50),
+            settings.GetValue("sldManualColor", 500),
+            settings.GetValue("sldLedBrightness", 50),
+            settings.GetValue("sldPlotInterval", 5),
+
+            settings.GetValue("cboMaxTempSource", 0),
+        };
+
+      string tmp = string.Join(";", data.Select(T => T.ToString()).ToArray());
+
+      serial.Write(Encoding.ASCII.GetBytes(tmp));
+      serial.Write(Encoding.ASCII.GetBytes("E"));
 
       if (logSensors != null && logSensors.Value && delayCount >= 4)
         logger.Log();
@@ -592,7 +749,7 @@ namespace OpenHardwareMonitor.GUI {
         delayCount++;
     }
 
-    private void SaveConfiguration() {
+    public void SaveConfiguration() {
       if (settings == null)
         return;
 
@@ -928,6 +1085,18 @@ namespace OpenHardwareMonitor.GUI {
 
     public HttpServer Server {
       get { return server; }
+    }
+
+    public Serial Serial {
+      get { return serial; }
+    }
+
+    private void serialConfigMenuItem_Click(object sender, EventArgs e) {
+      new SerialForm(this).ShowDialog();
+    }
+
+    private void runSerialMenuItem_Click(object sender, EventArgs e) {
+
     }
 
   }
